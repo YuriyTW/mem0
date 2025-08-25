@@ -53,110 +53,128 @@ class AsyncPGWrapper:
     def __init__(self, connection_params):
         self.connection_params = connection_params
         self.conn = None
-        self.loop = None
+        self._executor = None
         self._setup_connection()
     
     def _setup_connection(self):
-        """Setup asyncio loop and connection"""
+        """Setup dedicated thread for asyncpg"""
         import threading
         import concurrent.futures
+        import queue
         
-        try:
-            # Check if we're in an async context
-            self.loop = asyncio.get_running_loop()
-            # If we're already in a running loop, use a thread executor
-            self._use_thread_executor = True
-        except RuntimeError:
-            # No running loop, we can create one
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            self._use_thread_executor = False
+        # Always use thread executor to avoid loop conflicts
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._thread_queue = queue.Queue()
         
-        if self._use_thread_executor:
-            # Create connection in a separate thread
-            def create_connection():
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    return new_loop.run_until_complete(self._connect())
-                finally:
-                    new_loop.close()
+        def setup_thread():
+            """Setup asyncpg in dedicated thread"""
+            import asyncio
             
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(create_connection)
-                self.conn = future.result()
-                # Create a new event loop for this thread
-                self.thread_loop = asyncio.new_event_loop()
-        else:
-            self.conn = self.loop.run_until_complete(self._connect())
-    
-    async def _connect(self):
-        """Async connection setup"""
-        return await asyncpg.connect(**self.connection_params)
-    
-    def _run_async(self, coro):
-        """Run async function safely"""
-        if self._use_thread_executor:
-            import concurrent.futures
-            def run_in_thread():
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    return new_loop.run_until_complete(coro)
-                finally:
-                    new_loop.close()
+            # Create new loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(run_in_thread)
-                return future.result()
-        else:
-            return self.loop.run_until_complete(coro)
+            try:
+                # Create connection
+                conn = loop.run_until_complete(asyncpg.connect(**self.connection_params))
+                self._thread_queue.put(('conn', conn, loop))
+                
+                # Keep thread alive and handle requests
+                while True:
+                    try:
+                        item = self._thread_queue.get(timeout=0.1)
+                        if item[0] == 'stop':
+                            break
+                        elif item[0] == 'execute':
+                            query, params, result_queue = item[1], item[2], item[3]
+                            try:
+                                if params:
+                                    result = loop.run_until_complete(conn.execute(query, *params))
+                                else:
+                                    result = loop.run_until_complete(conn.execute(query))
+                                result_queue.put(('success', result))
+                            except Exception as e:
+                                result_queue.put(('error', e))
+                        elif item[0] == 'executemany':
+                            query, data, result_queue = item[1], item[2], item[3]
+                            try:
+                                result = loop.run_until_complete(conn.executemany(query, data))
+                                result_queue.put(('success', result))
+                            except Exception as e:
+                                result_queue.put(('error', e))
+                        elif item[0] == 'fetch':
+                            query, params, result_queue = item[1], item[2], item[3]
+                            try:
+                                if params:
+                                    result = loop.run_until_complete(conn.fetch(query, *params))
+                                else:
+                                    result = loop.run_until_complete(conn.fetch(query))
+                                result_queue.put(('success', result))
+                            except Exception as e:
+                                result_queue.put(('error', e))
+                        elif item[0] == 'fetchrow':
+                            query, params, result_queue = item[1], item[2], item[3]
+                            try:
+                                if params:
+                                    result = loop.run_until_complete(conn.fetchrow(query, *params))
+                                else:
+                                    result = loop.run_until_complete(conn.fetchrow(query))
+                                result_queue.put(('success', result))
+                            except Exception as e:
+                                result_queue.put(('error', e))
+                    except queue.Empty:
+                        continue
+                        
+            except Exception as e:
+                self._thread_queue.put(('error', e))
+            finally:
+                if 'conn' in locals():
+                    loop.run_until_complete(conn.close())
+                loop.close()
+        
+        # Start the dedicated thread
+        self._thread_future = self._executor.submit(setup_thread)
+        
+        # Wait for connection to be ready
+        result = self._thread_queue.get()
+        if result[0] == 'error':
+            raise result[1]
+        elif result[0] == 'conn':
+            # Connection successful, we can proceed
+            pass
+    
+    def _execute_in_thread(self, operation, *args):
+        """Execute operation in dedicated thread"""
+        import queue
+        result_queue = queue.Queue()
+        self._thread_queue.put((operation, *args, result_queue))
+        
+        result = result_queue.get()
+        if result[0] == 'error':
+            raise result[1]
+        return result[1]
     
     def execute(self, query, params=None):
         """Synchronous execute wrapper"""
-        return self._run_async(self._execute(query, params))
-    
-    async def _execute(self, query, params=None):
-        """Async execute"""
-        if params:
-            return await self.conn.execute(query, *params)
-        else:
-            return await self.conn.execute(query)
+        return self._execute_in_thread('execute', query, params)
     
     def executemany(self, query, data):
         """Synchronous executemany wrapper"""
-        return self._run_async(self._executemany(query, data))
-    
-    async def _executemany(self, query, data):
-        """Async executemany"""
-        return await self.conn.executemany(query, data)
+        return self._execute_in_thread('executemany', query, data)
     
     def fetchall(self, query, params=None):
         """Synchronous fetchall wrapper"""
-        return self._run_async(self._fetchall(query, params))
-    
-    async def _fetchall(self, query, params=None):
-        """Async fetchall"""
-        if params:
-            return await self.conn.fetch(query, *params)
-        else:
-            return await self.conn.fetch(query)
+        return self._execute_in_thread('fetch', query, params)
     
     def fetchone(self, query, params=None):
         """Synchronous fetchone wrapper"""
-        return self._run_async(self._fetchone(query, params))
-    
-    async def _fetchone(self, query, params=None):
-        """Async fetchone"""
-        if params:
-            return await self.conn.fetchrow(query, *params)
-        else:
-            return await self.conn.fetchrow(query)
+        return self._execute_in_thread('fetchrow', query, params)
     
     def close(self):
         """Close connection"""
-        if self.conn:
-            self._run_async(self.conn.close())
+        if self._executor:
+            self._thread_queue.put(('stop',))
+            self._executor.shutdown(wait=True)
 
 
 class AsyncPGCursor:
