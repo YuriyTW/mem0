@@ -58,21 +58,63 @@ class AsyncPGWrapper:
     
     def _setup_connection(self):
         """Setup asyncio loop and connection"""
+        import threading
+        import concurrent.futures
+        
         try:
-            self.loop = asyncio.get_event_loop()
+            # Check if we're in an async context
+            self.loop = asyncio.get_running_loop()
+            # If we're already in a running loop, use a thread executor
+            self._use_thread_executor = True
         except RuntimeError:
+            # No running loop, we can create one
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+            self._use_thread_executor = False
         
-        self.conn = self.loop.run_until_complete(self._connect())
+        if self._use_thread_executor:
+            # Create connection in a separate thread
+            def create_connection():
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    return new_loop.run_until_complete(self._connect())
+                finally:
+                    new_loop.close()
+            
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(create_connection)
+                self.conn = future.result()
+                # Create a new event loop for this thread
+                self.thread_loop = asyncio.new_event_loop()
+        else:
+            self.conn = self.loop.run_until_complete(self._connect())
     
     async def _connect(self):
         """Async connection setup"""
         return await asyncpg.connect(**self.connection_params)
     
+    def _run_async(self, coro):
+        """Run async function safely"""
+        if self._use_thread_executor:
+            import concurrent.futures
+            def run_in_thread():
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    return new_loop.run_until_complete(coro)
+                finally:
+                    new_loop.close()
+            
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(run_in_thread)
+                return future.result()
+        else:
+            return self.loop.run_until_complete(coro)
+    
     def execute(self, query, params=None):
         """Synchronous execute wrapper"""
-        return self.loop.run_until_complete(self._execute(query, params))
+        return self._run_async(self._execute(query, params))
     
     async def _execute(self, query, params=None):
         """Async execute"""
@@ -83,7 +125,7 @@ class AsyncPGWrapper:
     
     def executemany(self, query, data):
         """Synchronous executemany wrapper"""
-        return self.loop.run_until_complete(self._executemany(query, data))
+        return self._run_async(self._executemany(query, data))
     
     async def _executemany(self, query, data):
         """Async executemany"""
@@ -91,7 +133,7 @@ class AsyncPGWrapper:
     
     def fetchall(self, query, params=None):
         """Synchronous fetchall wrapper"""
-        return self.loop.run_until_complete(self._fetchall(query, params))
+        return self._run_async(self._fetchall(query, params))
     
     async def _fetchall(self, query, params=None):
         """Async fetchall"""
@@ -102,7 +144,7 @@ class AsyncPGWrapper:
     
     def fetchone(self, query, params=None):
         """Synchronous fetchone wrapper"""
-        return self.loop.run_until_complete(self._fetchone(query, params))
+        return self._run_async(self._fetchone(query, params))
     
     async def _fetchone(self, query, params=None):
         """Async fetchone"""
@@ -114,7 +156,7 @@ class AsyncPGWrapper:
     def close(self):
         """Close connection"""
         if self.conn:
-            self.loop.run_until_complete(self.conn.close())
+            self._run_async(self.conn.close())
 
 
 class AsyncPGCursor:
