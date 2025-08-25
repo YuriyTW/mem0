@@ -745,7 +745,7 @@ class Memory(MemoryBase):
 
         existing_embeddings = {data: self.embedding_model.embed(data, "update")}
 
-        self._update_memory(memory_id, data, existing_embeddings)
+        self._update_memory(memory_id, data, existing_embeddings, metadata=None)
         return {"message": "Memory updated successfully!"}
 
     def delete(self, memory_id):
@@ -1609,7 +1609,7 @@ class AsyncMemory(MemoryBase):
         embeddings = await asyncio.to_thread(self.embedding_model.embed, data, "update")
         existing_embeddings = {data: embeddings}
 
-        await self._update_memory(memory_id, data, existing_embeddings)
+        await self._update_memory(memory_id, data, existing_embeddings, metadata=None)
         return {"message": "Memory updated successfully!"}
 
     async def delete(self, memory_id):
