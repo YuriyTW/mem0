@@ -1760,7 +1760,7 @@ class AsyncMemory(MemoryBase):
 
         return result
 
-    async def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
+    async def _update_memory(self, memory_id, data, existing_embeddings, metadata):
         logger.info(f"Updating memory with {data=}")
 
         try:
@@ -1771,7 +1771,9 @@ class AsyncMemory(MemoryBase):
 
         prev_value = existing_memory.payload.get("data")
 
-        new_metadata = deepcopy(metadata) if metadata is not None else {}
+
+        logger.info(f">>> Updating memory with {existing_memory}")
+        new_metadata = deepcopy(metadata) if metadata is not None else deepcopy(existing_memory.payload)
 
         new_metadata["data"] = data
         new_metadata["hash"] = hashlib.md5(data.encode()).hexdigest()
