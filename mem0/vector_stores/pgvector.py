@@ -1,15 +1,10 @@
 import json
 import logging
-import asyncio
 from typing import List, Optional
 
 from pydantic import BaseModel
 
-# Try to import psycopg (psycopg3) first, then psycopg2, then asyncpg
-PSYCOPG_VERSION = None
-execute_values = None
-Json = None
-
+# Try to import psycopg (psycopg3) first, then fall back to psycopg2
 try:
     import psycopg
     from psycopg import execute_values
@@ -25,16 +20,10 @@ except ImportError:
         logger = logging.getLogger(__name__)
         logger.info("Using psycopg2 for PostgreSQL connections")
     except ImportError:
-        try:
-            import asyncpg
-            PSYCOPG_VERSION = 'asyncpg'
-            logger = logging.getLogger(__name__)
-            logger.info("Using asyncpg for PostgreSQL connections")
-        except ImportError:
-            raise ImportError(
-                "None of 'psycopg', 'psycopg2', or 'asyncpg' libraries are available. "
-                "Please install one of them using 'pip install psycopg', 'pip install psycopg2', or 'pip install asyncpg'."
-            )
+        raise ImportError(
+            "Neither 'psycopg' nor 'psycopg2' library is available. "
+            "Please install one of them using 'pip install psycopg' or 'pip install psycopg2'."
+        )
 
 from mem0.vector_stores.base import VectorStoreBase
 
@@ -45,166 +34,6 @@ class OutputData(BaseModel):
     id: Optional[str]
     score: Optional[float]
     payload: Optional[dict]
-
-
-class AsyncPGWrapper:
-    """Wrapper to make asyncpg work with synchronous interface"""
-    
-    def __init__(self, connection_params):
-        self.connection_params = connection_params
-        self.conn = None
-        self._executor = None
-        self._setup_connection()
-    
-    def _setup_connection(self):
-        """Setup dedicated thread for asyncpg"""
-        import threading
-        import concurrent.futures
-        import queue
-        
-        # Always use thread executor to avoid loop conflicts
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        self._thread_queue = queue.Queue()
-        
-        def setup_thread():
-            """Setup asyncpg in dedicated thread"""
-            import asyncio
-            
-            # Create new loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                # Create connection
-                conn = loop.run_until_complete(asyncpg.connect(**self.connection_params))
-                self._thread_queue.put(('conn', conn, loop))
-                
-                # Keep thread alive and handle requests
-                while True:
-                    try:
-                        item = self._thread_queue.get(timeout=0.1)
-                        if item[0] == 'stop':
-                            break
-                        elif item[0] == 'execute':
-                            query, params, result_queue = item[1], item[2], item[3]
-                            try:
-                                if params:
-                                    result = loop.run_until_complete(conn.execute(query, *params))
-                                else:
-                                    result = loop.run_until_complete(conn.execute(query))
-                                result_queue.put(('success', result))
-                            except Exception as e:
-                                result_queue.put(('error', e))
-                        elif item[0] == 'executemany':
-                            query, data, result_queue = item[1], item[2], item[3]
-                            try:
-                                result = loop.run_until_complete(conn.executemany(query, data))
-                                result_queue.put(('success', result))
-                            except Exception as e:
-                                result_queue.put(('error', e))
-                        elif item[0] == 'fetch':
-                            query, params, result_queue = item[1], item[2], item[3]
-                            try:
-                                if params:
-                                    result = loop.run_until_complete(conn.fetch(query, *params))
-                                else:
-                                    result = loop.run_until_complete(conn.fetch(query))
-                                result_queue.put(('success', result))
-                            except Exception as e:
-                                result_queue.put(('error', e))
-                        elif item[0] == 'fetchrow':
-                            query, params, result_queue = item[1], item[2], item[3]
-                            try:
-                                if params:
-                                    result = loop.run_until_complete(conn.fetchrow(query, *params))
-                                else:
-                                    result = loop.run_until_complete(conn.fetchrow(query))
-                                result_queue.put(('success', result))
-                            except Exception as e:
-                                result_queue.put(('error', e))
-                    except queue.Empty:
-                        continue
-                        
-            except Exception as e:
-                self._thread_queue.put(('error', e))
-            finally:
-                if 'conn' in locals():
-                    loop.run_until_complete(conn.close())
-                loop.close()
-        
-        # Start the dedicated thread
-        self._thread_future = self._executor.submit(setup_thread)
-        
-        # Wait for connection to be ready
-        result = self._thread_queue.get()
-        if result[0] == 'error':
-            raise result[1]
-        elif result[0] == 'conn':
-            # Connection successful, we can proceed
-            pass
-    
-    def _execute_in_thread(self, operation, *args):
-        """Execute operation in dedicated thread"""
-        import queue
-        result_queue = queue.Queue()
-        self._thread_queue.put((operation, *args, result_queue))
-        
-        result = result_queue.get()
-        if result[0] == 'error':
-            raise result[1]
-        return result[1]
-    
-    def execute(self, query, params=None):
-        """Synchronous execute wrapper"""
-        return self._execute_in_thread('execute', query, params)
-    
-    def executemany(self, query, data):
-        """Synchronous executemany wrapper"""
-        return self._execute_in_thread('executemany', query, data)
-    
-    def fetchall(self, query, params=None):
-        """Synchronous fetchall wrapper"""
-        return self._execute_in_thread('fetch', query, params)
-    
-    def fetchone(self, query, params=None):
-        """Synchronous fetchone wrapper"""
-        return self._execute_in_thread('fetchrow', query, params)
-    
-    def close(self):
-        """Close connection"""
-        if self._executor:
-            self._thread_queue.put(('stop',))
-            self._executor.shutdown(wait=True)
-
-
-class AsyncPGCursor:
-    """Cursor-like interface for asyncpg"""
-    
-    def __init__(self, wrapper):
-        self.wrapper = wrapper
-        self._last_result = None
-    
-    def execute(self, query, params=None):
-        """Execute query"""
-        if query.strip().upper().startswith('SELECT'):
-            self._last_result = self.wrapper.fetchall(query, params)
-        else:
-            self._last_result = self.wrapper.execute(query, params)
-        return self._last_result
-    
-    def fetchall(self):
-        """Return last result if it was a SELECT"""
-        return self._last_result if isinstance(self._last_result, list) else []
-    
-    def fetchone(self):
-        """Return first row from last result"""
-        if isinstance(self._last_result, list) and self._last_result:
-            return self._last_result[0]
-        return None
-    
-    def close(self):
-        """Close cursor (no-op for asyncpg)"""
-        pass
 
 
 class PGVector(VectorStoreBase):
@@ -246,54 +75,6 @@ class PGVector(VectorStoreBase):
         self.embedding_model_dims = embedding_model_dims
 
         # Connection setup with priority: connection_pool > connection_string > individual parameters
-        if PSYCOPG_VERSION == 'asyncpg':
-            self._setup_asyncpg_connection(
-                dbname, user, password, host, port, sslmode, connection_string, connection_pool
-            )
-        else:
-            self._setup_psycopg_connection(
-                dbname, user, password, host, port, sslmode, connection_string, connection_pool
-            )
-        
-        collections = self.list_cols()
-        if collection_name not in collections:
-            self.create_col(embedding_model_dims)
-    
-    def _setup_asyncpg_connection(self, dbname, user, password, host, port, sslmode, connection_string, connection_pool):
-        """Setup connection using asyncpg"""
-        if connection_pool is not None:
-            raise NotImplementedError("Connection pools not supported with asyncpg fallback")
-        
-        if connection_string is not None:
-            # Parse connection string for asyncpg
-            import urllib.parse
-            parsed = urllib.parse.urlparse(connection_string)
-            conn_params = {
-                'host': parsed.hostname or host,
-                'port': parsed.port or port,
-                'user': parsed.username or user,
-                'password': parsed.password or password,
-                'database': parsed.path.lstrip('/') or dbname,
-            }
-        else:
-            conn_params = {
-                'host': host,
-                'port': port,
-                'user': user,
-                'password': password,
-                'database': dbname,
-            }
-        
-        if sslmode:
-            conn_params['ssl'] = sslmode not in ('disable', 'allow')
-        
-        self.wrapper = AsyncPGWrapper(conn_params)
-        self.conn = self.wrapper  # For compatibility
-        self.cur = AsyncPGCursor(self.wrapper)
-        self.connection_pool = None
-    
-    def _setup_psycopg_connection(self, dbname, user, password, host, port, sslmode, connection_string, connection_pool):
-        """Setup connection using psycopg/psycopg2"""
         if connection_pool is not None:
             # Use provided connection pool
             self.conn = connection_pool.getconn()
@@ -335,6 +116,10 @@ class PGVector(VectorStoreBase):
         
         self.cur = self.conn.cursor()
 
+        collections = self.list_cols()
+        if collection_name not in collections:
+            self.create_col(embedding_model_dims)
+
     def create_col(self, embedding_model_dims):
         """
         Create a new collection (table in PostgreSQL).
@@ -375,8 +160,7 @@ class PGVector(VectorStoreBase):
             """
             )
 
-        if PSYCOPG_VERSION != 'asyncpg':
-            self.conn.commit()
+        self.conn.commit()
 
     def insert(self, vectors, payloads=None, ids=None):
         """
@@ -391,18 +175,12 @@ class PGVector(VectorStoreBase):
         json_payloads = [json.dumps(payload) for payload in payloads]
 
         data = [(id, vector, payload) for id, vector, payload in zip(ids, vectors, json_payloads)]
-        
-        if PSYCOPG_VERSION == 'asyncpg':
-            # Use executemany for asyncpg
-            query = f"INSERT INTO {self.collection_name} (id, vector, payload) VALUES ($1, $2, $3)"
-            self.wrapper.executemany(query, data)
-        else:
-            execute_values(
-                self.cur,
-                f"INSERT INTO {self.collection_name} (id, vector, payload) VALUES %s",
-                data,
-            )
-            self.conn.commit()
+        execute_values(
+            self.cur,
+            f"INSERT INTO {self.collection_name} (id, vector, payload) VALUES %s",
+            data,
+        )
+        self.conn.commit()
 
     def search(self, query, vectors, limit=5, filters=None):
         """
@@ -418,40 +196,27 @@ class PGVector(VectorStoreBase):
             list: Search results.
         """
         filter_conditions = []
-        filter_params = [vectors]
+        filter_params = []
 
         if filters:
             for k, v in filters.items():
-                if PSYCOPG_VERSION == 'asyncpg':
-                    filter_conditions.append(f"payload->>${len(filter_params)+1} = ${len(filter_params)+2}")
-                else:
-                    filter_conditions.append("payload->>%s = %s")
+                filter_conditions.append("payload->>%s = %s")
                 filter_params.extend([k, str(v)])
 
         filter_clause = "WHERE " + " AND ".join(filter_conditions) if filter_conditions else ""
 
-        if PSYCOPG_VERSION == 'asyncpg':
-            query_sql = f"""
-                SELECT id, vector <=> $1::vector AS distance, payload
-                FROM {self.collection_name}
-                {filter_clause}
-                ORDER BY distance
-                LIMIT ${len(filter_params)+1}
-            """
-            filter_params.append(limit)
-            results = self.wrapper.fetchall(query_sql, filter_params)
-        else:
-            query_sql = f"""
-                SELECT id, vector <=> %s::vector AS distance, payload
-                FROM {self.collection_name}
-                {filter_clause}
-                ORDER BY distance
-                LIMIT %s
-            """
-            filter_params.append(limit)
-            self.cur.execute(query_sql, filter_params)
-            results = self.cur.fetchall()
+        self.cur.execute(
+            f"""
+            SELECT id, vector <=> %s::vector AS distance, payload
+            FROM {self.collection_name}
+            {filter_clause}
+            ORDER BY distance
+            LIMIT %s
+        """,
+            (vectors, *filter_params, limit),
+        )
 
+        results = self.cur.fetchall()
         return [OutputData(id=str(r[0]), score=float(r[1]), payload=r[2]) for r in results]
 
     def delete(self, vector_id):
@@ -461,11 +226,8 @@ class PGVector(VectorStoreBase):
         Args:
             vector_id (str): ID of the vector to delete.
         """
-        if PSYCOPG_VERSION == 'asyncpg':
-            self.wrapper.execute(f"DELETE FROM {self.collection_name} WHERE id = $1", [vector_id])
-        else:
-            self.cur.execute(f"DELETE FROM {self.collection_name} WHERE id = %s", (vector_id,))
-            self.conn.commit()
+        self.cur.execute(f"DELETE FROM {self.collection_name} WHERE id = %s", (vector_id,))
+        self.conn.commit()
 
     def update(self, vector_id, vector=None, payload=None):
         """
@@ -477,23 +239,13 @@ class PGVector(VectorStoreBase):
             payload (Dict, optional): Updated payload.
         """
         if vector:
-            if PSYCOPG_VERSION == 'asyncpg':
-                self.wrapper.execute(
-                    f"UPDATE {self.collection_name} SET vector = $1 WHERE id = $2",
-                    [vector, vector_id]
-                )
-            else:
-                self.cur.execute(
-                    f"UPDATE {self.collection_name} SET vector = %s WHERE id = %s",
-                    (vector, vector_id),
-                )
+            self.cur.execute(
+                f"UPDATE {self.collection_name} SET vector = %s WHERE id = %s",
+                (vector, vector_id),
+            )
         if payload:
-            if PSYCOPG_VERSION == 'asyncpg':
-                self.wrapper.execute(
-                    f"UPDATE {self.collection_name} SET payload = $1 WHERE id = $2",
-                    [json.dumps(payload), vector_id]
-                )
-            elif PSYCOPG_VERSION == 3:
+            # Handle JSON serialization based on psycopg version
+            if PSYCOPG_VERSION == 3:
                 # psycopg3 uses psycopg.types.json.Json
                 self.cur.execute(
                     f"UPDATE {self.collection_name} SET payload = %s WHERE id = %s",
@@ -505,8 +257,7 @@ class PGVector(VectorStoreBase):
                     f"UPDATE {self.collection_name} SET payload = %s WHERE id = %s",
                     (psycopg2.extras.Json(payload), vector_id),
                 )
-        if PSYCOPG_VERSION != 'asyncpg':
-            self.conn.commit()
+        self.conn.commit()
 
     def get(self, vector_id) -> OutputData:
         """
@@ -518,18 +269,11 @@ class PGVector(VectorStoreBase):
         Returns:
             OutputData: Retrieved vector.
         """
-        if PSYCOPG_VERSION == 'asyncpg':
-            result = self.wrapper.fetchone(
-                f"SELECT id, vector, payload FROM {self.collection_name} WHERE id = $1",
-                [vector_id]
-            )
-        else:
-            self.cur.execute(
-                f"SELECT id, vector, payload FROM {self.collection_name} WHERE id = %s",
-                (vector_id,),
-            )
-            result = self.cur.fetchone()
-        
+        self.cur.execute(
+            f"SELECT id, vector, payload FROM {self.collection_name} WHERE id = %s",
+            (vector_id,),
+        )
+        result = self.cur.fetchone()
         if not result:
             return None
         return OutputData(id=str(result[0]), score=None, payload=result[2])
@@ -541,20 +285,13 @@ class PGVector(VectorStoreBase):
         Returns:
             List[str]: List of collection names.
         """
-        if PSYCOPG_VERSION == 'asyncpg':
-            results = self.wrapper.fetchall("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-        else:
-            self.cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-            results = self.cur.fetchall()
-        return [row[0] for row in results]
+        self.cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+        return [row[0] for row in self.cur.fetchall()]
 
     def delete_col(self):
         """Delete a collection."""
-        if PSYCOPG_VERSION == 'asyncpg':
-            self.wrapper.execute(f"DROP TABLE IF EXISTS {self.collection_name}")
-        else:
-            self.cur.execute(f"DROP TABLE IF EXISTS {self.collection_name}")
-            self.conn.commit()
+        self.cur.execute(f"DROP TABLE IF EXISTS {self.collection_name}")
+        self.conn.commit()
 
     def col_info(self):
         """
@@ -563,27 +300,18 @@ class PGVector(VectorStoreBase):
         Returns:
             Dict[str, Any]: Collection information.
         """
-        query = f"""
-            SELECT 
-                table_name, 
-                (SELECT COUNT(*) FROM {self.collection_name}) as row_count,
-                (SELECT pg_size_pretty(pg_total_relation_size('{self.collection_name}'))) as total_size
-            FROM information_schema.tables 
-            WHERE table_schema = 'public' AND table_name = $1
-        """ if PSYCOPG_VERSION == 'asyncpg' else f"""
+        self.cur.execute(
+            f"""
             SELECT 
                 table_name, 
                 (SELECT COUNT(*) FROM {self.collection_name}) as row_count,
                 (SELECT pg_size_pretty(pg_total_relation_size('{self.collection_name}'))) as total_size
             FROM information_schema.tables 
             WHERE table_schema = 'public' AND table_name = %s
-        """
-        
-        if PSYCOPG_VERSION == 'asyncpg':
-            result = self.wrapper.fetchone(query, [self.collection_name])
-        else:
-            self.cur.execute(query, (self.collection_name,))
-            result = self.cur.fetchone()
+        """,
+            (self.collection_name,),
+        )
+        result = self.cur.fetchone()
         return {"name": result[0], "count": result[1], "size": result[2]}
 
     def list(self, filters=None, limit=100):
@@ -602,34 +330,21 @@ class PGVector(VectorStoreBase):
 
         if filters:
             for k, v in filters.items():
-                if PSYCOPG_VERSION == 'asyncpg':
-                    filter_conditions.append(f"payload->>${len(filter_params)+1} = ${len(filter_params)+2}")
-                else:
-                    filter_conditions.append("payload->>%s = %s")
+                filter_conditions.append("payload->>%s = %s")
                 filter_params.extend([k, str(v)])
 
         filter_clause = "WHERE " + " AND ".join(filter_conditions) if filter_conditions else ""
 
-        if PSYCOPG_VERSION == 'asyncpg':
-            query = f"""
-                SELECT id, vector, payload
-                FROM {self.collection_name}
-                {filter_clause}
-                LIMIT ${len(filter_params)+1}
-            """
-            filter_params.append(limit)
-            results = self.wrapper.fetchall(query, filter_params)
-        else:
-            query = f"""
-                SELECT id, vector, payload
-                FROM {self.collection_name}
-                {filter_clause}
-                LIMIT %s
-            """
-            filter_params.append(limit)
-            self.cur.execute(query, filter_params)
-            results = self.cur.fetchall()
+        query = f"""
+            SELECT id, vector, payload
+            FROM {self.collection_name}
+            {filter_clause}
+            LIMIT %s
+        """
 
+        self.cur.execute(query, (*filter_params, limit))
+
+        results = self.cur.fetchall()
         return [[OutputData(id=str(r[0]), score=None, payload=r[2]) for r in results]]
 
     def __del__(self):
@@ -639,10 +354,7 @@ class PGVector(VectorStoreBase):
         if hasattr(self, "cur"):
             self.cur.close()
         if hasattr(self, "conn"):
-            if PSYCOPG_VERSION == 'asyncpg':
-                if hasattr(self, "wrapper"):
-                    self.wrapper.close()
-            elif hasattr(self, "connection_pool") and self.connection_pool is not None:
+            if hasattr(self, "connection_pool") and self.connection_pool is not None:
                 # Return connection to pool instead of closing it
                 self.connection_pool.putconn(self.conn)
             else:
