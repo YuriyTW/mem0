@@ -86,6 +86,7 @@ class OpenAILLM(LLMBase):
         response_format=None,
         tools: Optional[List[Dict]] = None,
         tool_choice: str = "auto",
+        metadata: Optional[Dict] = None,
         **kwargs,
     ):
         """
@@ -96,6 +97,7 @@ class OpenAILLM(LLMBase):
             response_format (str or object, optional): Format of the response. Defaults to "text".
             tools (list, optional): List of tools that the model can call. Defaults to None.
             tool_choice (str, optional): Tool choice method. Defaults to "auto".
+            metadata (dict, optional): Additional metadata to pass to the LLM. Can be used for context, user info, etc. Defaults to None.
             **kwargs: Additional OpenAI-specific parameters.
 
         Returns:
@@ -107,6 +109,8 @@ class OpenAILLM(LLMBase):
             "model": self.config.model,
             "messages": messages,
         })
+        if metadata:
+            params["metadata"] = metadata
 
         if os.getenv("OPENROUTER_API_KEY"):
             openrouter_params = {}

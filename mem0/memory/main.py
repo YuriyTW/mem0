@@ -1044,6 +1044,7 @@ class AsyncMemory(MemoryBase):
         agent_id: Optional[str] = None,
         run_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        llm_metadata: Optional[Dict[str, Any]] = None,
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
@@ -1058,6 +1059,7 @@ class AsyncMemory(MemoryBase):
             agent_id (str, optional): ID of the agent creating the memory. Defaults to None.
             run_id (str, optional): ID of the run creating the memory. Defaults to None.
             metadata (dict, optional): Metadata to store with the memory. Defaults to None.
+            llm_metadata (dict, optional): Additional metadata to pass to LLM calls during processing. Defaults to None.
             infer (bool, optional): Whether to infer the memories. Defaults to True.
             memory_type (str, optional): Type of memory to create. Defaults to None.
                                          Pass "procedural_memory" to create procedural memories.
@@ -1086,7 +1088,7 @@ class AsyncMemory(MemoryBase):
 
         if agent_id is not None and memory_type == MemoryType.PROCEDURAL.value:
             results = await self._create_procedural_memory(
-                messages, metadata=processed_metadata, prompt=prompt, llm=llm
+                messages, metadata=processed_metadata, prompt=prompt, llm=llm, llm_metadata=llm_metadata
             )
             return results
 
@@ -1096,7 +1098,7 @@ class AsyncMemory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         vector_store_task = asyncio.create_task(
-            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer)
+            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, llm_metadata)
         )
         graph_task = asyncio.create_task(self._add_to_graph(messages, effective_filters))
 
@@ -1126,6 +1128,7 @@ class AsyncMemory(MemoryBase):
         metadata: dict,
         effective_filters: dict,
         infer: bool,
+        llm_metadata: Optional[Dict[str, Any]] = None,
     ):
         if not infer:
             returned_memories = []
@@ -1174,6 +1177,7 @@ class AsyncMemory(MemoryBase):
             self.llm.generate_response,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             response_format={"type": "json_object"},
+            metadata=llm_metadata,
         )
         try:
             response = remove_code_blocks(response)
@@ -1224,6 +1228,7 @@ class AsyncMemory(MemoryBase):
                     self.llm.generate_response,
                     messages=[{"role": "user", "content": function_calling_prompt}],
                     response_format={"type": "json_object"},
+                    metadata=llm_metadata,
                 )
             except Exception as e:
                 logger.error(f"Error in new memory actions response: {e}")
@@ -1589,13 +1594,14 @@ class AsyncMemory(MemoryBase):
 
         return original_memories
 
-    async def update(self, memory_id, data):
+    async def update(self, memory_id, data, llm_metadata: Optional[Dict[str, Any]] = None):
         """
         Update a memory by ID asynchronously.
 
         Args:
             memory_id (str): ID of the memory to update.
             data (str): New content to update the memory with.
+            llm_metadata (dict, optional): Additional metadata to pass to LLM calls during update. Defaults to None.
 
         Returns:
             dict: Success message indicating the memory was updated.
@@ -1709,7 +1715,7 @@ class AsyncMemory(MemoryBase):
         capture_event("mem0._create_memory", self, {"memory_id": memory_id, "sync_type": "async"})
         return memory_id
 
-    async def _create_procedural_memory(self, messages, metadata=None, llm=None, prompt=None):
+    async def _create_procedural_memory(self, messages, metadata=None, llm=None, prompt=None, llm_metadata: Optional[Dict[str, Any]] = None):
         """
         Create a procedural memory asynchronously
 
@@ -1718,6 +1724,7 @@ class AsyncMemory(MemoryBase):
             metadata (dict): Metadata to create a procedural memory from.
             llm (llm, optional): LLM to use for the procedural memory creation. Defaults to None.
             prompt (str, optional): Prompt to use for the procedural memory creation. Defaults to None.
+            llm_metadata (dict, optional): Additional metadata to pass to LLM calls. Defaults to None.
         """
         try:
             from langchain_core.messages.utils import (
@@ -1743,7 +1750,7 @@ class AsyncMemory(MemoryBase):
                 response = await asyncio.to_thread(llm.invoke, input=parsed_messages)
                 procedural_memory = response.content
             else:
-                procedural_memory = await asyncio.to_thread(self.llm.generate_response, messages=parsed_messages)
+                procedural_memory = await asyncio.to_thread(self.llm.generate_response, messages=parsed_messages, metadata=llm_metadata)
         except Exception as e:
             logger.error(f"Error generating procedural memory summary: {e}")
             raise
