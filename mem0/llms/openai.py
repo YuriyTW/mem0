@@ -144,10 +144,13 @@ class OpenAILLM(LLMBase):
                 }
                 openrouter_params["extra_headers"] = openrouter_extra_headers
 
-            if extra_headers:
-                openrouter_params["extra_headers"] = {**openrouter_extra_headers, **extra_headers}
-
             params.update(**openrouter_params)
+
+        if extra_headers:
+            if "extra_headers" in params:
+                params["extra_headers"].update(extra_headers)
+            else:
+                params["extra_headers"] = extra_headers
 
         if response_format:
             params["response_format"] = response_format
