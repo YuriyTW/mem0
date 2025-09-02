@@ -12,7 +12,9 @@ from mem0.memory.utils import extract_json
 
 
 class OpenAILLM(LLMBase):
-    def __init__(self, config: Optional[Union[BaseLlmConfig, OpenAIConfig, Dict]] = None):
+    def __init__(
+        self, config: Optional[Union[BaseLlmConfig, OpenAIConfig, Dict]] = None
+    ):
         # Convert to OpenAIConfig if needed
         if config is None:
             config = OpenAIConfig()
@@ -46,7 +48,11 @@ class OpenAILLM(LLMBase):
             )
         else:
             api_key = self.config.api_key or os.getenv("OPENAI_API_KEY")
-            base_url = self.config.openai_base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+            base_url = (
+                self.config.openai_base_url
+                or os.getenv("OPENAI_BASE_URL")
+                or "https://api.openai.com/v1"
+            )
 
             self.client = OpenAI(api_key=api_key, base_url=base_url)
 
@@ -72,7 +78,9 @@ class OpenAILLM(LLMBase):
                     processed_response["tool_calls"].append(
                         {
                             "name": tool_call.function.name,
-                            "arguments": json.loads(extract_json(tool_call.function.arguments)),
+                            "arguments": json.loads(
+                                extract_json(tool_call.function.arguments)
+                            ),
                         }
                     )
 
@@ -87,6 +95,8 @@ class OpenAILLM(LLMBase):
         tools: Optional[List[Dict]] = None,
         tool_choice: str = "auto",
         metadata: Optional[Dict] = None,
+        extra_headers: Optional[Dict] = None,
+        extra_body: Optional[Dict] = None,
         **kwargs,
     ):
         """
@@ -98,19 +108,27 @@ class OpenAILLM(LLMBase):
             tools (list, optional): List of tools that the model can call. Defaults to None.
             tool_choice (str, optional): Tool choice method. Defaults to "auto".
             metadata (dict, optional): Additional metadata to pass to the LLM. Can be used for context, user info, etc. Defaults to None.
+            extra_headers (dict, optional): Additional headers to pass to the OpenAI API call. Defaults to None.
+            extra_body (dict, optional): Additional body parameters to pass to the OpenAI API call. Defaults to None.
             **kwargs: Additional OpenAI-specific parameters.
 
         Returns:
             json: The generated response.
         """
         params = self._get_supported_params(messages=messages, **kwargs)
-        
-        params.update({
-            "model": self.config.model,
-            "messages": messages,
-        })
+
+        params.update(
+            {
+                "model": self.config.model,
+                "messages": messages,
+            }
+        )
         if metadata:
             params["metadata"] = metadata
+
+        # Add extra_body parameters to params
+        if extra_body:
+            params.update(extra_body)
 
         if os.getenv("OPENROUTER_API_KEY"):
             openrouter_params = {}
@@ -120,17 +138,22 @@ class OpenAILLM(LLMBase):
                 params.pop("model")
 
             if self.config.site_url and self.config.app_name:
-                extra_headers = {
+                openrouter_extra_headers = {
                     "HTTP-Referer": self.config.site_url,
                     "X-Title": self.config.app_name,
                 }
-                openrouter_params["extra_headers"] = extra_headers
+                openrouter_params["extra_headers"] = openrouter_extra_headers
+
+            if extra_headers:
+                openrouter_params["extra_headers"] = {**openrouter_extra_headers, **extra_headers}
 
             params.update(**openrouter_params)
 
         if response_format:
             params["response_format"] = response_format
-        if tools:  # TODO: Remove tools if no issues found with new memory addition logic
+        if (
+            tools
+        ):  # TODO: Remove tools if no issues found with new memory addition logic
             params["tools"] = tools
             params["tool_choice"] = tool_choice
         response = self.client.chat.completions.create(**params)
