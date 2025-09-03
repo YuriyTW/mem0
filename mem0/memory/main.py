@@ -191,6 +191,7 @@ class Memory(MemoryBase):
         agent_id: Optional[str] = None,
         run_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        llm_metadata: Optional[Dict[str, Any]] = None,
         extra_headers: Optional[Dict[str, Any]] = None,
         extra_body: Optional[Dict[str, Any]] = None,
         infer: bool = True,
@@ -210,6 +211,7 @@ class Memory(MemoryBase):
             agent_id (str, optional): ID of the agent creating the memory. Defaults to None.
             run_id (str, optional): ID of the run creating the memory. Defaults to None.
             metadata (dict, optional): Metadata to store with the memory. Defaults to None.
+            llm_metadata (dict, optional): Additional metadata to pass to LLM calls during processing. Defaults to None.
             extra_headers (dict, optional): Additional headers to pass to LLM API calls. Defaults to None.
             extra_body (dict, optional): Additional body parameters to pass to LLM API calls. Defaults to None.
             infer (bool, optional): If True (default), an LLM is used to extract key facts from
@@ -251,7 +253,7 @@ class Memory(MemoryBase):
             raise ValueError("messages must be str, dict, or list[dict]")
 
         if agent_id is not None and memory_type == MemoryType.PROCEDURAL.value:
-            results = self._create_procedural_memory(messages, metadata=processed_metadata, prompt=prompt, extra_headers=extra_headers, extra_body=extra_body)
+            results = self._create_procedural_memory(messages, metadata=processed_metadata, prompt=prompt, llm_metadata=llm_metadata, extra_headers=extra_headers, extra_body=extra_body)
             return results
 
         if self.config.llm.config.get("enable_vision"):
@@ -260,7 +262,7 @@ class Memory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer, extra_headers, extra_body)
+            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer, llm_metadata, extra_headers, extra_body)
             future2 = executor.submit(self._add_to_graph, messages, effective_filters)
 
             concurrent.futures.wait([future1, future2])
@@ -286,7 +288,7 @@ class Memory(MemoryBase):
 
         return {"results": vector_store_result}
 
-    def _add_to_vector_store(self, messages, metadata, filters, infer, extra_headers=None, extra_body=None):
+    def _add_to_vector_store(self, messages, metadata, filters, infer, llm_metadata=None, extra_headers=None, extra_body=None):
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -337,6 +339,7 @@ class Memory(MemoryBase):
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
+            metadata=llm_metadata,
             extra_headers=extra_headers,
             extra_body=extra_body,
         )
@@ -386,6 +389,7 @@ class Memory(MemoryBase):
                 response: str = self.llm.generate_response(
                     messages=[{"role": "user", "content": function_calling_prompt}],
                     response_format={"type": "json_object"},
+                    metadata=llm_metadata,
                     extra_headers=extra_headers,
                     extra_body=extra_body,
                 )
@@ -734,15 +738,13 @@ class Memory(MemoryBase):
 
         return original_memories
 
-    def update(self, memory_id, data, extra_headers=None, extra_body=None):
+    def update(self, memory_id, data):
         """
         Update a memory by ID.
 
         Args:
             memory_id (str): ID of the memory to update.
             data (str): New content to update the memory with.
-            extra_headers (dict, optional): Additional headers to pass to LLM API calls. Defaults to None.
-            extra_body (dict, optional): Additional body parameters to pass to LLM API calls. Defaults to None.
 
         Returns:
             dict: Success message indicating the memory was updated.
@@ -846,7 +848,7 @@ class Memory(MemoryBase):
         capture_event("mem0._create_memory", self, {"memory_id": memory_id, "sync_type": "sync"})
         return memory_id
 
-    def _create_procedural_memory(self, messages, metadata=None, prompt=None, extra_headers=None, extra_body=None):
+    def _create_procedural_memory(self, messages, metadata=None, prompt=None, llm_metadata=None, extra_headers=None, extra_body=None):
         """
         Create a procedural memory
 
@@ -867,7 +869,7 @@ class Memory(MemoryBase):
         ]
 
         try:
-            procedural_memory = self.llm.generate_response(messages=parsed_messages, extra_headers=extra_headers, extra_body=extra_body)
+            procedural_memory = self.llm.generate_response(messages=parsed_messages, metadata=llm_metadata, extra_headers=extra_headers, extra_body=extra_body)
         except Exception as e:
             logger.error(f"Error generating procedural memory summary: {e}")
             raise
@@ -1614,16 +1616,13 @@ class AsyncMemory(MemoryBase):
 
         return original_memories
 
-    async def update(self, memory_id, data, llm_metadata: Optional[Dict[str, Any]] = None, extra_headers: Optional[Dict[str, Any]] = None, extra_body: Optional[Dict[str, Any]] = None):
+    async def update(self, memory_id, data):
         """
         Update a memory by ID asynchronously.
 
         Args:
             memory_id (str): ID of the memory to update.
             data (str): New content to update the memory with.
-            llm_metadata (dict, optional): Additional metadata to pass to LLM calls during update. Defaults to None.
-            extra_headers (dict, optional): Additional headers to pass to LLM API calls. Defaults to None.
-            extra_body (dict, optional): Additional body parameters to pass to LLM API calls. Defaults to None.
 
         Returns:
             dict: Success message indicating the memory was updated.
