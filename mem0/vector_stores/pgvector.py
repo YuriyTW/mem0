@@ -116,28 +116,40 @@ class AsyncPGWrapper:
         return future.result()
         
     async def _connect_async(self):
-        """Establish async connection."""
-        if self._connection is None:
-            # Disable prepared statement caching for compatibility with pgbouncer
+        """Establish async connection pool."""
+        if self._pool is None:
+            # Create connection pool with health checks enabled
             conn_params = self.connection_params.copy()
             conn_params['statement_cache_size'] = 0
-            self._connection = await asyncpg.connect(**conn_params)
-        return self._connection
+            self._pool = await asyncpg.create_pool(
+                min_size=1,           # Minimum connections in pool
+                max_size=100,         # Maximum connections in pool
+                max_inactive_connection_lifetime=300.0,  # Close connections after 5 min of inactivity
+                command_timeout=60,   # Query timeout in seconds
+                timeout=30,           # Connection acquisition timeout (30 seconds)
+                max_queries=50000,    # Number of queries before connection is recycled
+                max_cached_statement_lifetime=300,  # Recycle prepared statements after 5 min
+                **conn_params
+            )
+        return self._pool
         
     async def _execute_async(self, query, *args):
         """Execute a query asynchronously."""
-        conn = await self._connect_async()
-        return await conn.execute(query, *args)
+        pool = await self._connect_async()
+        async with pool.acquire() as conn:
+            return await conn.execute(query, *args)
         
     async def _fetch_async(self, query, *args):
         """Fetch query results asynchronously."""
-        conn = await self._connect_async()
-        return await conn.fetch(query, *args)
+        pool = await self._connect_async()
+        async with pool.acquire() as conn:
+            return await conn.fetch(query, *args)
         
     async def _fetchone_async(self, query, *args):
         """Fetch one result asynchronously."""
-        conn = await self._connect_async()
-        return await conn.fetchrow(query, *args)
+        pool = await self._connect_async()
+        async with pool.acquire() as conn:
+            return await conn.fetchrow(query, *args)
         
     def execute(self, query, *args):
         """Execute a query synchronously."""
@@ -153,10 +165,11 @@ class AsyncPGWrapper:
         
     async def _executemany_async(self, query, param_list):
         """Execute many queries asynchronously."""
-        conn = await self._connect_async()
-        async with conn.transaction():
-            for params in param_list:
-                await conn.execute(query, *params)
+        pool = await self._connect_async()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                for params in param_list:
+                    await conn.execute(query, *params)
                 
     def executemany(self, query, param_list):
         """Execute many queries synchronously."""
@@ -167,15 +180,18 @@ class AsyncPGWrapper:
         pass
         
     def close(self):
-        """Close the connection and cleanup resources."""
+        """Close the connection pool and cleanup resources."""
         async def _close():
+            if self._pool:
+                await self._pool.close()
+                self._pool = None
             if self._connection:
                 await self._connection.close()
                 self._connection = None
-                
-        if self._loop and self._connection:
+
+        if self._loop and (self._pool or self._connection):
             self._run_async(_close())
-            
+
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
